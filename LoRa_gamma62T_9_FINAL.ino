@@ -15,7 +15,7 @@
 #include <ArduinoJson.h>
 #include <PubSubClient.h>
 #include <string.h>  // For interrupt-safe strcpy/memcpy
-#include <secrets.h> // stored at /home/rmc/Arduino/libraries/secrets/secrets.h
+#include <secrets.h> // stored at ~/Arduino/libraries/secrets/secrets.h
 
 // --- WDT HEADER ---
 #include "esp_task_wdt.h"
