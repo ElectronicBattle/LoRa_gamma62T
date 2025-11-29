@@ -7,7 +7,9 @@
 // Timestamp capture moved for closer alignment with event trigger
 // ALL OK for "production" 22/11/25
 // starting to add duck.ai recommended improvements beginning with
-// correcting the serial rate from 115700 to 115200
+// Phase 1, Rank 2: ISR Safety (COMPLETED)
+// Phase 2, Rank 3: Non-Blocking LED Blink (NEW)
+// 
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -27,6 +29,8 @@ void setup();
 void loop();
 void reconnectMQTT();
 void checkAndReconnectNetwork();
+void initBlink(int sourcePin, int sinkPin); // NEW PROTOTYPE
+void blinkHandler();                         // NEW PROTOTYPE
 // ---------------------------------------------------
 
 // ---------------------------------------------------------------------
@@ -74,7 +78,7 @@ WiFiClientSecure secureClient;
 PubSubClient mqttClient(espClient);
 
 // --- GLOBAL VARIABLES FOR NON-BLOCKING RECONNECT ---
-// Try to reconnect every 2 minutes (120,000 ms) if Wi-Fi or MQTT is lost.
+// Try to reconnect every 5 seconds (5,000 ms) if Wi-Fi or MQTT is lost.
 const unsigned long RECONNECT_INTERVAL_MS = 5000; 
 unsigned long last_reconnect_attempt_ms = 0;
 bool is_online_mode = false; // Tracks current operating mode (Wi-Fi AND MQTT connected)
@@ -84,6 +88,12 @@ bool is_online_mode = false; // Tracks current operating mode (Wi-Fi AND MQTT co
 const int MAX_RECONNECT_FAILURES = 10;
 int reconnect_fail_count = 0; 
 // ----------------------------------------------------
+
+// --- NEW GLOBAL VARIABLES FOR NON-BLOCKING BLINK (STATE MACHINE) ---
+volatile unsigned long blink_stop_time_ms = 0; // Time when the LED should turn off
+volatile int blink_source_pin = -1;            // The pin currently HIGH (Source)
+volatile int blink_sink_pin = -1;              // The pin currently LOW (Sink)
+// -------------------------------------------------------------------
 
 
 // Structure to store a single event (using char arrays for interrupt safety)
@@ -120,55 +130,8 @@ struct GateData
 
 
 // ----------------------------------------------------
-// --- INTERRUPT HANDLER ---
+// --- INTERRUPT HANDLER (Phase 1, Rank 2 safety fix applied) ---
 // ----------------------------------------------------
-
-// void IRAM_ATTR handleGateInterrupt()
-// {
-//   unsigned long interrupt_time = millis();
-
-//   int current_btn = digitalRead(BUTTON_PIN);
-//   int current_sensor = digitalRead(SENSOR_PIN);
-
-//   if (interrupt_time - last_interrupt_time > DEBOUNCE_DELAY_MS)
-//   {
-
-//     bool btn_changed = (current_btn != isr_button_state);
-//     bool sensor_changed = (current_sensor != isr_sensor_state);
-
-//     if (btn_changed || sensor_changed)
-//     {
-
-//       if (((queue_head + 1) % MAX_QUEUE_SIZE) != queue_tail)
-//       {
-
-//         const char* new_status;
-//         const char* new_source;
-
-//         if (sensor_changed)
-//         {
-//           new_status = (current_sensor == LOW) ? "OPEN" : "CLOSED";
-//           new_source = "SENSOR";
-//         }
-//         else if (btn_changed)
-//         {
-//           new_status = (current_btn == LOW) ? "CLOSED" : "OPEN";
-//           new_source = "BUTTON";
-//         }
-
-//         // Push Event onto Queue using strcpy
-//         strcpy((char*)event_queue[queue_head].status, new_status);
-//         strcpy((char*)event_queue[queue_head].source, new_source);
-
-//         queue_head = (queue_head + 1) % MAX_QUEUE_SIZE;
-
-//         last_interrupt_time = interrupt_time;
-//         isr_button_state = current_btn;
-//         isr_sensor_state = current_sensor;
-//       }
-//     }
-//   }
-// }
 
 void IRAM_ATTR handleGateInterrupt()
 {
@@ -219,6 +182,7 @@ void IRAM_ATTR handleGateInterrupt()
         current_event->source[SOURCE_SIZE - 1] = '\0';
         // -----------------------------------------------------------
 
+
         queue_head = (queue_head + 1) % MAX_QUEUE_SIZE;
 
         last_interrupt_time = interrupt_time;
@@ -227,11 +191,55 @@ void IRAM_ATTR handleGateInterrupt()
       }
     }
   }
-}
+} // <-- END of handleGateInterrupt()
 
 
 // ----------------------------------------------------
-// --- DATA PARSING & TIME & UTILITY FUNCTIONS ---
+// --- NON-BLOCKING LED BLINK FUNCTIONS (NEW) ---
+// ----------------------------------------------------
+
+// Function to initiate a non-blocking LED flash
+void initBlink(int sourcePin, int sinkPin)
+{
+  // 1. Set the global pins for the active blink
+  blink_source_pin = sourcePin;
+  blink_sink_pin = sinkPin;
+
+  // 2. Set the time when the blink must end
+  blink_stop_time_ms = millis() + FLASH_DURATION_MS;
+
+  // 3. Start the LED immediately (non-blocking)
+  digitalWrite(blink_sink_pin, LOW);
+  digitalWrite(blink_source_pin, HIGH);
+}
+
+
+// Function to check and turn off the LED if the time has elapsed
+void blinkHandler()
+{
+  // Only execute if a blink is currently active (source pin is tracked)
+  if (blink_source_pin != -1) 
+  {
+    // Check if the stop time has been reached or surpassed
+    if (millis() >= blink_stop_time_ms)
+    {
+      // 1. Turn off the LED
+      digitalWrite(blink_source_pin, LOW);
+      digitalWrite(blink_sink_pin, LOW);
+      
+      // 2. Reset the state variables (signals that no blink is active)
+      blink_source_pin = -1;
+      blink_sink_pin = -1;
+
+      Serial.println("LED blink finished (non-blocking).");
+    }
+    // If the time hasn't been reached, do nothing (i.e., don't block)
+  }
+} // <-- END of blinkHandler()
+
+
+// ----------------------------------------------------
+// --- DATA PARSING & TIME & UTILITY FUNCTIONS (Unmodified) ---
 // ----------------------------------------------------
 
 // --- OPTIMIZED urlEncode() FUNCTION (Faster C-string logic) ---
@@ -371,7 +379,7 @@ String getTimestamp()
 }  // <-- END of getTimestamp()
 
 // ----------------------------------------------------
-// --- MQTT FUNCTIONS (Single Attempt) ---
+// --- MQTT FUNCTIONS (Single Attempt) (Unmodified) ---
 // ----------------------------------------------------
 
 // This is a single, non-blocking attempt to connect.
@@ -540,15 +548,11 @@ void sendPushover()
   {  // Check specifically for 200 OK
     Serial.printf("Pushover success! Response Code: %d\n", httpResponseCode);
     
-    // --- RED FLASH TRIGGER: ONLY on 200 OK (ASYNC CONFIRMATION) ---
-    Serial.println("--- FLASH 2 (Red PO CONFIRM) ---");
+    // --- RED FLASH TRIGGER: NOW NON-BLOCKING! ---
+    Serial.println("--- INITIATING FLASH 2 (Red PO CONFIRM) ---");
     // Use DRIVER B as Source, DRIVER A as Sink
-    digitalWrite(LED_DRIVER_A, LOW);  //16
-    digitalWrite(LED_DRIVER_B, HIGH); //14
-    delay(FLASH_DURATION_MS); // 100ms ON
-    digitalWrite(LED_DRIVER_A, LOW);
-    digitalWrite(LED_DRIVER_B, LOW); // Turn off Red immediately
-    // ----------------------------------------------------
+    initBlink(LED_DRIVER_B, LED_DRIVER_A);
+    // ------------------------------------------
 
   }
   else if (httpResponseCode > 0)
@@ -565,7 +569,7 @@ void sendPushover()
 
 
 // ----------------------------------------------------
-// --- NON-BLOCKING NETWORK MANAGEMENT ---
+// --- NON-BLOCKING NETWORK MANAGEMENT (Unmodified) ---
 // ----------------------------------------------------
 
 void checkAndReconnectNetwork()
@@ -650,6 +654,7 @@ void checkAndReconnectNetwork()
 
 void setup()
 {
+  // --- PHASE 1, RANK 1 FIX: CHANGED 115700 TO 115200 (Assumed) ---
   Serial.begin(115200);
 
   Serial.println("\n--- Starting Dual-Input Gate Alert System ---");
@@ -760,6 +765,11 @@ void loop()
   // --- WDT RESET (FEEDING THE DOG) ---
   // This must be called regularly to prevent a WDT reboot.
   esp_task_wdt_reset();
+  
+  // --- NEW: NON-BLOCKING LED BLINK HANDLER ---
+  // This ensures the LED is turned off exactly when its time is up,
+  // without blocking the rest of the loop.
+  blinkHandler();
 
   // --- NEW: NON-BLOCKING NETWORK MANAGEMENT ---
   checkAndReconnectNetwork();
@@ -817,20 +827,14 @@ void loop()
       parseGammaData();
 
       // -----------------------------------------------------------------
-      // --- SYNCHRONOUS GREEN FLASH (RX Confirm) ---
+      // --- SYNCHRONOUS GREEN FLASH (RX Confirm) - NOW NON-BLOCKING ---
       // This confirms successful data decode.
       // -----------------------------------------------------------------
 
-      // 1. FLASH 1: RX CONFIRM (Green - assumed GPIO 16 HIGH / DRIVER A HIGH)
-      Serial.println("--- FLASH 1 (Green RX) ---");
+      // 1. INITIATE FLASH 1: RX CONFIRM (Green - assumed GPIO 16 HIGH / DRIVER A HIGH)
+      Serial.println("--- INITIATING FLASH 1 (Green RX) ---");
       // Use DRIVER A as Source, DRIVER B as Sink
-      digitalWrite(LED_DRIVER_B, LOW);
-      digitalWrite(LED_DRIVER_A, HIGH); 
-      delay(FLASH_DURATION_MS); // 100ms ON
-
-      // 2. Turn OFF Green immediately to start the network latency gap
-      digitalWrite(LED_DRIVER_A, LOW);
-      digitalWrite(LED_DRIVER_B, LOW);
+      initBlink(LED_DRIVER_A, LED_DRIVER_B);
       // -----------------------------------------------------------------
     }
     else
@@ -871,6 +875,6 @@ void loop()
     Serial.println("--- Event Handled ---\n");
   }
 
-  // Small delay to prevent a busy loop
+  // Small delay to prevent a busy loop (kept minimal and safe for WDT)
   delay(10);
 }  // <-- END of loop()
