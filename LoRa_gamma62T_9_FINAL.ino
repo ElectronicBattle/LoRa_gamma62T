@@ -6,7 +6,8 @@
 // Added Non-Blocking Network Reconnection Logic
 // Timestamp capture moved for closer alignment with event trigger
 // ALL OK for "production" 22/11/25
-
+// starting to add duck.ai recommended improvements beginning with
+// correcting the serial rate from 115700 to 115200
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -122,6 +123,53 @@ struct GateData
 // --- INTERRUPT HANDLER ---
 // ----------------------------------------------------
 
+// void IRAM_ATTR handleGateInterrupt()
+// {
+//   unsigned long interrupt_time = millis();
+
+//   int current_btn = digitalRead(BUTTON_PIN);
+//   int current_sensor = digitalRead(SENSOR_PIN);
+
+//   if (interrupt_time - last_interrupt_time > DEBOUNCE_DELAY_MS)
+//   {
+
+//     bool btn_changed = (current_btn != isr_button_state);
+//     bool sensor_changed = (current_sensor != isr_sensor_state);
+
+//     if (btn_changed || sensor_changed)
+//     {
+
+//       if (((queue_head + 1) % MAX_QUEUE_SIZE) != queue_tail)
+//       {
+
+//         const char* new_status;
+//         const char* new_source;
+
+//         if (sensor_changed)
+//         {
+//           new_status = (current_sensor == LOW) ? "OPEN" : "CLOSED";
+//           new_source = "SENSOR";
+//         }
+//         else if (btn_changed)
+//         {
+//           new_status = (current_btn == LOW) ? "CLOSED" : "OPEN";
+//           new_source = "BUTTON";
+//         }
+
+//         // Push Event onto Queue using strcpy
+//         strcpy((char*)event_queue[queue_head].status, new_status);
+//         strcpy((char*)event_queue[queue_head].source, new_source);
+
+//         queue_head = (queue_head + 1) % MAX_QUEUE_SIZE;
+
+//         last_interrupt_time = interrupt_time;
+//         isr_button_state = current_btn;
+//         isr_sensor_state = current_sensor;
+//       }
+//     }
+//   }
+// }
+
 void IRAM_ATTR handleGateInterrupt()
 {
   unsigned long interrupt_time = millis();
@@ -155,9 +203,21 @@ void IRAM_ATTR handleGateInterrupt()
           new_source = "BUTTON";
         }
 
-        // Push Event onto Queue using strcpy
-        strcpy((char*)event_queue[queue_head].status, new_status);
-        strcpy((char*)event_queue[queue_head].source, new_source);
+        // --- NEW: Push Event onto Queue using strncpy for safety ---
+        volatile Event* current_event = &event_queue[queue_head];
+        const size_t STATUS_SIZE = sizeof(current_event->status);
+        const size_t SOURCE_SIZE = sizeof(current_event->source);
+
+        // Copy Status (max 9 chars + null terminator)
+        strncpy((char*)current_event->status, new_status, STATUS_SIZE - 1);
+        // Explicitly set the last character to null to ensure termination
+        current_event->status[STATUS_SIZE - 1] = '\0'; 
+
+        // Copy Source (max 9 chars + null terminator)
+        strncpy((char*)current_event->source, new_source, SOURCE_SIZE - 1);
+        // Explicitly set the last character to null to ensure termination
+        current_event->source[SOURCE_SIZE - 1] = '\0';
+        // -----------------------------------------------------------
 
         queue_head = (queue_head + 1) % MAX_QUEUE_SIZE;
 
@@ -590,7 +650,7 @@ void checkAndReconnectNetwork()
 
 void setup()
 {
-  Serial.begin(115700);
+  Serial.begin(115200);
 
   Serial.println("\n--- Starting Dual-Input Gate Alert System ---");
 
