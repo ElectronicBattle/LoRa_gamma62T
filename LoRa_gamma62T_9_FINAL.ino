@@ -8,7 +8,8 @@
 // ALL OK for "production" 22/11/25
 // starting to add duck.ai recommended improvements beginning with
 // Phase 1, Rank 2: ISR Safety (COMPLETED)
-// Phase 2, Rank 3: Non-Blocking LED Blink (NEW)
+// Phase 2, Rank 3: Non-Blocking LED Blink (COMPLETED)
+// Phase 2, Rank 4: Replace Arduino String Usage (NEW)
 // 
 
 #include <WiFi.h>
@@ -19,6 +20,7 @@
 #include <PubSubClient.h>
 #include <string.h>  // For interrupt-safe strcpy/memcpy
 #include <secrets.h> // stored at ~/Arduino/libraries/secrets/secrets.h
+#include <ctype.h>   // For isalnum in C-style urlEncode
 
 // --- WDT HEADER ---
 #include "esp_task_wdt.h"
@@ -29,8 +31,9 @@ void setup();
 void loop();
 void reconnectMQTT();
 void checkAndReconnectNetwork();
-void initBlink(int sourcePin, int sinkPin); // NEW PROTOTYPE
-void blinkHandler();                         // NEW PROTOTYPE
+void initBlink(int sourcePin, int sinkPin); 
+void blinkHandler();                         
+void urlEncode(const char* input, char* output, size_t outputSize); // NEW C-STRING PROTOTYPE
 // ---------------------------------------------------
 
 // ---------------------------------------------------------------------
@@ -68,6 +71,13 @@ byte packet_buffer[PACKET_SIZE] = { 0 };
 #define PACKET_CR 0x0D  // Carriage Return
 #define PACKET_LF 0x0A  // Line Feed
 
+// --- NEW DEFINITIONS FOR C-STRING BUFFERS ---
+#define TIMESTAMP_SIZE 16   // e.g., "12:34:56" + null
+#define STATUS_SIZE 10      // "OPEN" or "CLOSED" + null (Event struct is 10)
+#define MESSAGE_BUF_SIZE 150 // Buffer for Pushover message content
+#define POSTDATA_BUF_SIZE 512 // Buffer for Pushover final POST body
+#define URL_BUF_SIZE 64     // Buffer for HTTPS URL
+// ----------------------------------------------------
 
 // ----------------------------------------------------
 // --- GLOBAL OBJECTS & EVENT QUEUE ---
@@ -78,29 +88,25 @@ WiFiClientSecure secureClient;
 PubSubClient mqttClient(espClient);
 
 // --- GLOBAL VARIABLES FOR NON-BLOCKING RECONNECT ---
-// Try to reconnect every 5 seconds (5,000 ms) if Wi-Fi or MQTT is lost.
 const unsigned long RECONNECT_INTERVAL_MS = 5000; 
 unsigned long last_reconnect_attempt_ms = 0;
-bool is_online_mode = false; // Tracks current operating mode (Wi-Fi AND MQTT connected)
-// ----------------------------------------------------
+bool is_online_mode = false; 
 
 // --- NEW AUTO-REBOOT COUNTER ---
 const int MAX_RECONNECT_FAILURES = 10;
 int reconnect_fail_count = 0; 
-// ----------------------------------------------------
 
 // --- NEW GLOBAL VARIABLES FOR NON-BLOCKING BLINK (STATE MACHINE) ---
-volatile unsigned long blink_stop_time_ms = 0; // Time when the LED should turn off
-volatile int blink_source_pin = -1;            // The pin currently HIGH (Source)
-volatile int blink_sink_pin = -1;              // The pin currently LOW (Sink)
+volatile unsigned long blink_stop_time_ms = 0; 
+volatile int blink_source_pin = -1;            
+volatile int blink_sink_pin = -1;              
 // -------------------------------------------------------------------
-
 
 // Structure to store a single event (using char arrays for interrupt safety)
 struct Event
 {
-  char status[10];
-  char source[10];
+  char status[STATUS_SIZE];
+  char source[STATUS_SIZE];
 };
 
 // Define the queue size
@@ -117,20 +123,21 @@ volatile int isr_sensor_state = HIGH;
 volatile unsigned long last_interrupt_time = 0;
 const unsigned long DEBOUNCE_DELAY_MS = 25;
 
-// Structure to hold all status data for transmission
+// --- REPLACED STRING MEMBERS WITH CHAR ARRAYS ---
 struct GateData
 {
-  String timestamp;
-  String status;
+  char timestamp[TIMESTAMP_SIZE]; // Max 16 chars
+  char status[STATUS_SIZE];       // Max 10 chars
   float rssi_dbm = 0.0;
   float batt_voltage = 0.0;
   bool batt_ok = false;
   bool data_valid = false;
 } current_data;
+// ---------------------------------------------
 
 
 // ----------------------------------------------------
-// --- INTERRUPT HANDLER (Phase 1, Rank 2 safety fix applied) ---
+// --- INTERRUPT HANDLER (Unmodified) ---
 // ----------------------------------------------------
 
 void IRAM_ATTR handleGateInterrupt()
@@ -166,22 +173,19 @@ void IRAM_ATTR handleGateInterrupt()
           new_source = "BUTTON";
         }
 
-        // --- NEW: Push Event onto Queue using strncpy for safety ---
+        // --- Push Event onto Queue using strncpy for safety ---
         volatile Event* current_event = &event_queue[queue_head];
-        const size_t STATUS_SIZE = sizeof(current_event->status);
-        const size_t SOURCE_SIZE = sizeof(current_event->source);
+        const size_t STATUS_SIZE_E = sizeof(current_event->status);
+        const size_t SOURCE_SIZE_E = sizeof(current_event->source);
 
-        // Copy Status (max 9 chars + null terminator)
-        strncpy((char*)current_event->status, new_status, STATUS_SIZE - 1);
-        // Explicitly set the last character to null to ensure termination
-        current_event->status[STATUS_SIZE - 1] = '\0'; 
+        // Copy Status
+        strncpy((char*)current_event->status, new_status, STATUS_SIZE_E - 1);
+        current_event->status[STATUS_SIZE_E - 1] = '\0'; 
 
-        // Copy Source (max 9 chars + null terminator)
-        strncpy((char*)current_event->source, new_source, SOURCE_SIZE - 1);
-        // Explicitly set the last character to null to ensure termination
-        current_event->source[SOURCE_SIZE - 1] = '\0';
+        // Copy Source
+        strncpy((char*)current_event->source, new_source, SOURCE_SIZE_E - 1);
+        current_event->source[SOURCE_SIZE_E - 1] = '\0';
         // -----------------------------------------------------------
-
 
         queue_head = (queue_head + 1) % MAX_QUEUE_SIZE;
 
@@ -195,92 +199,50 @@ void IRAM_ATTR handleGateInterrupt()
 
 
 // ----------------------------------------------------
-// --- NON-BLOCKING LED BLINK FUNCTIONS (NEW) ---
+// --- DATA PARSING & TIME & UTILITY FUNCTIONS ---
 // ----------------------------------------------------
 
-// Function to initiate a non-blocking LED flash
-void initBlink(int sourcePin, int sinkPin)
+// --- REPLACED: C-string urlEncode function (writes to a buffer) ---
+void urlEncode(const char* input, char* output, size_t outputSize)
 {
-  // 1. Set the global pins for the active blink
-  blink_source_pin = sourcePin;
-  blink_sink_pin = sinkPin;
+  size_t input_len = strlen(input);
+  size_t encoded_index = 0;
 
-  // 2. Set the time when the blink must end
-  blink_stop_time_ms = millis() + FLASH_DURATION_MS;
-
-  // 3. Start the LED immediately (non-blocking)
-  digitalWrite(blink_sink_pin, LOW);
-  digitalWrite(blink_source_pin, HIGH);
-}
-
-
-// Function to check and turn off the LED if the time has elapsed
-void blinkHandler()
-{
-  // Only execute if a blink is currently active (source pin is tracked)
-  if (blink_source_pin != -1) 
+  for (size_t i = 0; i < input_len; i++) 
   {
-    // Check if the stop time has been reached or surpassed
-    if (millis() >= blink_stop_time_ms)
-    {
-      // 1. Turn off the LED
-      digitalWrite(blink_source_pin, LOW);
-      digitalWrite(blink_sink_pin, LOW);
-      
-      // 2. Reset the state variables (signals that no blink is active)
-      blink_source_pin = -1;
-      blink_sink_pin = -1;
-
-      Serial.println("LED blink finished (non-blocking).");
+    char c = input[i];
+    
+    // Check if the output buffer has enough space for the current character:
+    // 1 byte for safe chars, 3 bytes for encoded chars, 1 byte for null terminator
+    if (encoded_index >= outputSize - 4) {
+      break; // Stop if output buffer is nearly full
     }
-    // If the time hasn't been reached, do nothing (i.e., don't block)
-  }
-} // <-- END of blinkHandler()
-
-
-// ----------------------------------------------------
-// --- DATA PARSING & TIME & UTILITY FUNCTIONS (Unmodified) ---
-// ----------------------------------------------------
-
-// --- OPTIMIZED urlEncode() FUNCTION (Faster C-string logic) ---
-String urlEncode(String str)
-{
-  // Buffer size set large enough for safety. Max 3x original length plus null terminator.
-  const int BUF_SIZE = 256; 
-  char encoded_buffer[BUF_SIZE]; 
-  int encoded_index = 0;
-
-  for (int i = 0; i < str.length() && encoded_index < BUF_SIZE - 4; i++) 
-  {
-    char c = str.charAt(i);
     
     if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~')
     {
-      encoded_buffer[encoded_index++] = c;
+      output[encoded_index++] = c;
     }
     else if (c == ' ')
     {
-      encoded_buffer[encoded_index++] = '+';
+      output[encoded_index++] = '+';
     }
     else
     {
-      // URL encode using hex values
-      encoded_buffer[encoded_index++] = '%';
+      // URL encode using hex values: %XX
+      output[encoded_index++] = '%';
       
       char code1 = (c >> 4) & 0xF;
       char code0 = c & 0xF;
       
-      encoded_buffer[encoded_index++] = (code1 < 10) ? (char)(code1 + '0') : (char)(code1 - 10 + 'A');
-      encoded_buffer[encoded_index++] = (code0 < 10) ? (char)(code0 + '0') : (char)(code0 - 10 + 'A');
+      output[encoded_index++] = (char)((code1 < 10) ? (code1 + '0') : (code1 - 10 + 'A'));
+      output[encoded_index++] = (char)((code0 < 10) ? (code0 + '0') : (code0 - 10 + 'A'));
     }
   }
-  encoded_buffer[encoded_index] = '\0'; // Null-terminate the string
-
-  return String(encoded_buffer);
+  output[encoded_index] = '\0'; // Null-terminate the string
 }
 
 
-// Attempts to read the full 10-byte packet from Serial2 (Gamma62T) with CR/LF Synchronization
+// Attempts to read the full 10-byte packet from Serial2 (Gamma62T) with CR/LF Synchronization (Unmodified)
 bool readGammaData()
 {
   unsigned long timeout = millis() + 500;
@@ -348,7 +310,7 @@ bool readGammaData()
   return false;
 }  // <-- END of readGammaData()
 
-void parseGammaData()
+void parseGammaData() // Unmodified
 {
   byte txvByte = packet_buffer[5];
   byte statByte = packet_buffer[6];
@@ -366,23 +328,25 @@ void parseGammaData()
   current_data.data_valid = true;
 }  // <-- END of parseGammaData()
 
-String getTimestamp()
+// --- MODIFIED: Writes timestamp to current_data.timestamp char array ---
+void getTimestamp()
 {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo))
   {
-    return "NTP Sync Failed";
+    strncpy(current_data.timestamp, "NTP Sync Failed", TIMESTAMP_SIZE);
+    current_data.timestamp[TIMESTAMP_SIZE - 1] = '\0';
+    return;
   }
-  char timeStr[64];
-  strftime(timeStr, sizeof(timeStr), "%H:%M:%S", &timeinfo);
-  return String(timeStr);
+  // Use strftime to write directly to the char array
+  strftime(current_data.timestamp, TIMESTAMP_SIZE, "%H:%M:%S", &timeinfo);
 }  // <-- END of getTimestamp()
 
 // ----------------------------------------------------
-// --- MQTT FUNCTIONS (Single Attempt) (Unmodified) ---
+// --- MQTT FUNCTIONS (UPDATED FOR C-STRINGS) ---
 // ----------------------------------------------------
 
-// This is a single, non-blocking attempt to connect.
+// This is a single, non-blocking attempt to connect. (Unmodified)
 void reconnectMQTT()
 {
   if (WiFi.status() != WL_CONNECTED)
@@ -406,38 +370,36 @@ void reconnectMQTT()
 }  // <-- END of reconnectMQTT()
 
 
-// new function to breakdown MQTT (now accepts unit)
+// new function to breakdown MQTT (now accepts unit) - MODIFIED
 void publishMQTTSimpleValue(const char* topicSuffix, float value, int precision, const char* unit)
 {
   if (!mqttClient.connected())
   {
-    // Do not attempt a reconnect here; let the loop() logic manage connection state.
     Serial.println("Publish failed: MQTT not connected.");
     return;
   }
 
-  // Construct the full topic
-  String fullTopic = "home/blue_gate/";
-  fullTopic.concat(topicSuffix);
+  // Use local char arrays instead of String for topic and payload
+  char fullTopic[64];
+  char floatPayload[10];
+  char textPayload[64]; 
+  
+  // Construct the full topic using snprintf
+  snprintf(fullTopic, sizeof(fullTopic), "home/blue_gate/%s", topicSuffix);
 
   // Convert the float value to a string
-  char floatPayload[10];
   dtostrf(value, 0, precision, floatPayload);
 
-  // --- CONSTRUCT THE FINAL, NON-GRAPHABLE TEXT STRING ---
-  String textPayload = String(topicSuffix);
-  textPayload.concat(": ");
-  textPayload.concat(floatPayload);
-  textPayload.concat(" ");
-  textPayload.concat(unit);
+  // --- CONSTRUCT THE FINAL, NON-GRAPHABLE TEXT STRING using snprintf ---
+  snprintf(textPayload, sizeof(textPayload), "%s: %s %s", topicSuffix, floatPayload, unit);
 
-  Serial.printf("Publishing to %s: %s\n", fullTopic.c_str(), textPayload.c_str());
+  Serial.printf("Publishing to %s: %s\n", fullTopic, textPayload);
 
-  mqttClient.publish(fullTopic.c_str(), textPayload.c_str(), false);  // Publish as text
+  mqttClient.publish(fullTopic, textPayload, false);  // Publish as text
 }  // <-- END of publishMQTTSimpleValue()
 
 
-void publishMQTTEvent()
+void publishMQTTEvent() // MODIFIED
 {
   if (!mqttClient.connected())
   {
@@ -462,6 +424,7 @@ void publishMQTTEvent()
   }
 
   char jsonBuffer[256];
+  // serializeJson handles c-strings automatically
   serializeJson(doc, jsonBuffer);
 
   Serial.print("Publishing JSON to MQTT topic ");
@@ -483,7 +446,7 @@ void publishMQTTEvent()
 
 
 // ----------------------------------------------------
-// --- PUSHOVER FUNCTIONS ---
+// --- PUSHOVER FUNCTIONS (UPDATED FOR C-STRINGS) ---
 // ----------------------------------------------------
 
 void sendPushover()
@@ -494,54 +457,58 @@ void sendPushover()
 
   HTTPClient http;
 
-  // --- FIX APPLIED HERE: Build URL safely using String concatenation ---
-  String url = "https://";
-  url += PUSHOVER_HOST;
-  url += "/1/messages.json";
+  // --- REPLACED: Build URL using char array and snprintf ---
+  char url[URL_BUF_SIZE];
+  snprintf(url, sizeof(url), "https://%s/1/messages.json", PUSHOVER_HOST);
   
   http.begin(secureClient, url);
-  // --------------------------------------------------------------------
+  // --------------------------------------------------------
   
   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
 
   // *** WDT SAFETY: Set an explicit timeout shorter than the 5s WDT. ***
   http.setTimeout(4000); // 4 seconds timeout for the blocking HTTP POST
 
-  String status = (current_data.status == "OPEN") ? "Blue Gate OPEN @ " : "Blue Gate CLOSED @ ";
+  // --- START: NEW SINGLE-LINE MESSAGE CONSTRUCTION (C-STRINGS) ---
+  char messageContent[MESSAGE_BUF_SIZE];
+  const char* statusPrefix = (strcmp(current_data.status, "OPEN") == 0) ? "Blue Gate OPEN @ " : "Blue Gate CLOSED @ ";
 
-  // --- START: NEW SINGLE-LINE MESSAGE CONSTRUCTION ---
-  String messageContent = status;
-
-  messageContent.reserve(100); // Reserve memory for the maximum possible message length
-  
-  messageContent += current_data.timestamp;
-
-  // Append RSSI data: " -62.0 dBm"
-  messageContent += " ";
-  messageContent += String(current_data.rssi_dbm, 1);
-  messageContent += " dBm";
-
-  // Append Battery data: " OK (2.60 V)"
-  messageContent += " ";
-  messageContent += (current_data.batt_ok ? "OK" : "LOW");
-  messageContent += " (";
-  messageContent += String(current_data.batt_voltage, 2);
-  messageContent += " V)";
+  // Use snprintf to build the message body safely
+  snprintf(messageContent, sizeof(messageContent), 
+           "%s%s %.1f dBm %s (%.2f V)",
+           statusPrefix,
+           current_data.timestamp,
+           current_data.rssi_dbm,
+           current_data.batt_ok ? "OK" : "LOW",
+           current_data.batt_voltage);
   // --- END: NEW SINGLE-LINE MESSAGE CONSTRUCTION ---
 
-  String postData = "token=";
-  postData.concat(PUSHOVER_TOKEN);
-  postData.concat("&user=");
-  postData.concat(PUSHOVER_USER);
-  postData.concat("&device=");
-  postData.concat(PUSHOVER_DEVICE);
-  postData.concat("&message=");
+  // --- URL ENCODE THE MESSAGE CONTENT ---
+  char encodedMessage[POSTDATA_BUF_SIZE]; // Use a large buffer for the encoded message
+  urlEncode(messageContent, encodedMessage, sizeof(encodedMessage));
 
-  postData.concat(urlEncode(messageContent));
+
+  // --- BUILD THE FINAL POST DATA (C-STRINGS) ---
+  char postData[POSTDATA_BUF_SIZE];
+  int len = 0;
+  
+  // Token
+  len += snprintf(postData + len, sizeof(postData) - len, "token=%s", PUSHOVER_TOKEN);
+  
+  // User
+  len += snprintf(postData + len, sizeof(postData) - len, "&user=%s", PUSHOVER_USER);
+  
+  // Device
+  len += snprintf(postData + len, sizeof(postData) - len, "&device=%s", PUSHOVER_DEVICE);
+  
+  // Message (Encoded)
+  len += snprintf(postData + len, sizeof(postData) - len, "&message=%s", encodedMessage);
 
   Serial.printf("Pushover Data Includes Device: %s\n", PUSHOVER_DEVICE);
+  Serial.printf("Pushover Post Data Length: %d\n", len);
 
   // POST the data and get the response code
+  // http.POST takes a const char* (C-string) directly
   int httpResponseCode = http.POST(postData);
 
   if (httpResponseCode == 200)
@@ -550,7 +517,6 @@ void sendPushover()
     
     // --- RED FLASH TRIGGER: NOW NON-BLOCKING! ---
     Serial.println("--- INITIATING FLASH 2 (Red PO CONFIRM) ---");
-    // Use DRIVER B as Source, DRIVER A as Sink
     initBlink(LED_DRIVER_B, LED_DRIVER_A);
     // ------------------------------------------
 
@@ -566,6 +532,39 @@ void sendPushover()
 
   http.end();
 }  // <-- END of sendPushover()
+
+
+// ----------------------------------------------------
+// --- NON-BLOCKING LED BLINK FUNCTIONS (Unmodified) ---
+// ----------------------------------------------------
+
+void initBlink(int sourcePin, int sinkPin)
+{
+  blink_source_pin = sourcePin;
+  blink_sink_pin = sinkPin;
+
+  blink_stop_time_ms = millis() + FLASH_DURATION_MS;
+
+  digitalWrite(blink_sink_pin, LOW);
+  digitalWrite(blink_source_pin, HIGH);
+}
+
+void blinkHandler()
+{
+  if (blink_source_pin != -1) 
+  {
+    if (millis() >= blink_stop_time_ms)
+    {
+      digitalWrite(blink_source_pin, LOW);
+      digitalWrite(blink_sink_pin, LOW);
+      
+      blink_source_pin = -1;
+      blink_sink_pin = -1;
+
+      Serial.println("LED blink finished (non-blocking).");
+    }
+  }
+} // <-- END of blinkHandler()
 
 
 // ----------------------------------------------------
@@ -649,7 +648,7 @@ void checkAndReconnectNetwork()
 
 
 // ----------------------------------------------------
-// --- SETUP and LOOP ---
+// --- SETUP and LOOP (Updated for C-Strings) ---
 // ----------------------------------------------------
 
 void setup()
@@ -698,15 +697,9 @@ void setup()
   // 3. Wi-Fi Connection & NTP Setup (WDT Protected & Blocking Startup)
   Serial.print("Attempting to connect to WiFi...");
 
-  // Set a timeout for 10 seconds (20 attempts * 500ms)
-  const int maxAttempts = 20;
-  int attemptCount = 0;
-
   // 3. Wi-Fi Connection & NTP Setup (NOW NON-BLOCKING)
   Serial.print("Starting Wi-Fi connection (non-blocking)...");
 
-  // We do NOT disable/re-enable the WDT here. We must keep it running.
-  // The built-in Wi-Fi logic is designed to work alongside the WDT.
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD); 
   Serial.println("Wi-Fi process started.");
 
@@ -717,7 +710,6 @@ void setup()
   // We rely entirely on checkAndReconnectNetwork() in the loop().
 
   // --- INITIALIZE NETWORK STATE AFTER NON-BLOCKING START ---
-  // The first checkAndReconnectNetwork() will run immediately in the loop()
   is_online_mode = false;
   
   // Initialize the timer so the first non-blocking check happens right away
@@ -763,21 +755,17 @@ void setup()
 void loop()
 {
   // --- WDT RESET (FEEDING THE DOG) ---
-  // This must be called regularly to prevent a WDT reboot.
   esp_task_wdt_reset();
   
-  // --- NEW: NON-BLOCKING LED BLINK HANDLER ---
-  // This ensures the LED is turned off exactly when its time is up,
-  // without blocking the rest of the loop.
+  // --- NON-BLOCKING LED BLINK HANDLER ---
   blinkHandler();
 
-  // --- NEW: NON-BLOCKING NETWORK MANAGEMENT ---
+  // --- NON-BLOCKING NETWORK MANAGEMENT ---
   checkAndReconnectNetwork();
 
   // --- CHECK 1: Keep the MQTT connection alive (only if online)
   if (is_online_mode)
   {
-    // PubSubClient's loop() handles pinging the broker and receiving data.
     mqttClient.loop();
   }
 
@@ -796,44 +784,38 @@ void loop()
     Serial.println("--- Gate Event Fired (Main Loop - From Queue) ---");
 
     // =======================================================
-    // --- FIX: CAPTURE TIMESTAMP HERE (AS EARLY AS POSSIBLE) ---
-    // Change logic: Time is available if WiFi is up, regardless of MQTT.
+    // --- CAPTURE TIMESTAMP HERE (NOW WRITING TO CHAR ARRAY) ---
     // =======================================================
     if (WiFi.status() == WL_CONNECTED)
     {
-      current_data.timestamp = getTimestamp();
+      getTimestamp(); // Writes directly to current_data.timestamp
     }
     else
     {
-      // If WiFi itself is down (true local mode), we cannot get time.
-      current_data.timestamp = "LOCAL TIME UNKNOWN";
+      strncpy(current_data.timestamp, "LOCAL TIME UNKNOWN", TIMESTAMP_SIZE);
+      current_data.timestamp[TIMESTAMP_SIZE - 1] = '\0';
     }
-    Serial.printf("Captured Timestamp: %s\n", current_data.timestamp.c_str());
+    Serial.printf("Captured Timestamp: %s\n", current_data.timestamp);
     // =======================================================
 
 
-    // --- ASSIGN STATUS & SOURCE ---
-    current_data.status = String(next_event.status);
+    // --- ASSIGN STATUS & SOURCE (NOW USING C-STRING COPY) ---
+    strncpy(current_data.status, next_event.status, STATUS_SIZE);
+    current_data.status[STATUS_SIZE - 1] = '\0'; // Ensure termination
 
     Serial.printf("Trigger Source: %s - ", next_event.source);
 
     // --- Execute Action ---
 
-    Serial.printf("Detected State: %s\n", current_data.status.c_str());
+    Serial.printf("Detected State: %s\n", current_data.status);
 
     // Read data from the Gamma62T module
     if (readGammaData())
     {
       parseGammaData();
 
-      // -----------------------------------------------------------------
       // --- SYNCHRONOUS GREEN FLASH (RX Confirm) - NOW NON-BLOCKING ---
-      // This confirms successful data decode.
-      // -----------------------------------------------------------------
-
-      // 1. INITIATE FLASH 1: RX CONFIRM (Green - assumed GPIO 16 HIGH / DRIVER A HIGH)
       Serial.println("--- INITIATING FLASH 1 (Green RX) ---");
-      // Use DRIVER A as Source, DRIVER B as Sink
       initBlink(LED_DRIVER_A, LED_DRIVER_B);
       // -----------------------------------------------------------------
     }
@@ -852,7 +834,6 @@ void loop()
       Serial.println("WiFi connected. Attempting notifications...");
 
       // Pushover only requires Wi-Fi/Internet, so it runs first
-      // This MUST run if Wi-Fi is connected, regardless of MQTT status.
       sendPushover(); // Runs the blocking HTTP call
 
       // MQTT requires Wi-Fi AND a successful broker connection check (is_online_mode)
@@ -875,6 +856,6 @@ void loop()
     Serial.println("--- Event Handled ---\n");
   }
 
-  // Small delay to prevent a busy loop (kept minimal and safe for WDT)
+  // Small delay to prevent a busy loop
   delay(10);
 }  // <-- END of loop()
