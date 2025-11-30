@@ -25,9 +25,7 @@
 //Diagnostic	Brownout/WDT Reset Diagnostics	Completed. 
 //The setup() function now checks and logs the reset reason, which is vital for diagnosing power or code issues.
 
-//Final Stable Version: Non-Blocking Serial FSM Implemented.
-
-
+// Final Stable Version: Non-Blocking Serial FSM Implemented with SECURE TLS.
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -48,7 +46,7 @@ void checkAndReconnectNetwork();
 void initBlink(int sourcePin, int sinkPin); 
 void blinkHandler();                         
 void urlEncode(const char* input, char* output, size_t outputSize);
-bool serialReadHandler(); // NEW NON-BLOCKING FSM
+bool serialReadHandler(); 
 void sendPushover();     
 // ---------------------------------------------------
 
@@ -252,7 +250,7 @@ void urlEncode(const char* input, char* output, size_t outputSize)
 }
 
 
-// --- NEW NON-BLOCKING SERIAL HANDLER (FSM) ---
+// --- NON-BLOCKING SERIAL HANDLER (FSM) ---
 bool serialReadHandler()
 {
   if (packet_ready) {
@@ -411,18 +409,22 @@ void publishMQTTEvent()
 }  
 
 // ----------------------------------------------------
-// --- PUSHOVER FUNCTIONS (Unmodified) ---
+// --- PUSHOVER FUNCTIONS (MODIFIED for TLS) ---
 // ----------------------------------------------------
 
 void sendPushover()
 {
   Serial.println("Attempting Pushover notification...");
-  secureClient.setInsecure();
+  
+  // *** REMOVED: secureClient.setInsecure(); ***
+  // *** ADDED: Set the long-life Root CA for secure verification ***
+  secureClient.setCACert(PUSHOVER_ROOT_CA);
+  
   HTTPClient http;
 
   char url[URL_BUF_SIZE];
   snprintf(url, sizeof(url), "https://%s/1/messages.json", PUSHOVER_HOST);
-  http.begin(secureClient, url);
+  http.begin(secureClient, url); // Use the secureClient, which now has the CA
   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
   http.setTimeout(4000); 
 
@@ -465,6 +467,7 @@ void sendPushover()
   }
   else
   {
+    // The connection failed, likely due to a TLS error (bad time, bad CA, etc.)
     Serial.printf("Pushover failed. Error: %s (%d). NO RED FLASH.\n", http.errorToString(httpResponseCode).c_str(), httpResponseCode);
   }
 
@@ -505,7 +508,7 @@ void blinkHandler()
 
 
 // ----------------------------------------------------
-// --- NON-BLOCKING NETWORK MANAGEMENT (MODIFIED) ---
+// --- NON-BLOCKING NETWORK MANAGEMENT (Unmodified) ---
 // ----------------------------------------------------
 
 void checkAndReconnectNetwork()
@@ -573,7 +576,7 @@ void checkAndReconnectNetwork()
 
 
 // ----------------------------------------------------
-// --- SETUP and LOOP (MODIFIED for FSM integration) ---
+// --- SETUP and LOOP (MODIFIED for TLS Time Check) ---
 // ----------------------------------------------------
 
 void setup()
@@ -705,14 +708,22 @@ void loop()
 
     if (WiFi.status() == WL_CONNECTED)
     {
-      Serial.println("WiFi connected. Attempting notifications...");
-
-      // Blocking call that triggers Red Flash on success
-      sendPushover(); 
-
-      if (is_online_mode) 
+      // *** NEW TIME CHECK FOR TLS VALIDATION ***
+      if (time(nullptr) > 100000) 
       {
-        publishMQTTEvent();
+        Serial.println("WiFi connected. Time synchronized. Attempting SECURE notifications...");
+
+        // Blocking call that triggers Red Flash on success
+        sendPushover(); 
+
+        if (is_online_mode) 
+        {
+          publishMQTTEvent();
+        }
+      }
+      else
+      {
+        Serial.println("WARNING: WiFi connected but NTP time not synced. Skipping secure notifications.");
       }
     }
     else
