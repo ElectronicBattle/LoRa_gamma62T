@@ -429,7 +429,7 @@ void sendPushover()
   http.setTimeout(4000); 
 
   char messageContent[MESSAGE_BUF_SIZE];
-  const char* statusPrefix = (strcmp(current_data.status, "OPEN") == 0) ? "Blue Gate OPEN @ " : "Blue Gate CLOSED @ ";
+  const char* statusPrefix = (strcmp(current_data.status, "OPEN") == 0) ? "OPEN @ " : "CLOSED @ ";
 
   snprintf(messageContent, sizeof(messageContent), 
            "%s%s %.1f dBm %s (%.2f V)",
