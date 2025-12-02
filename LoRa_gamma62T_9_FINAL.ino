@@ -614,6 +614,7 @@ void setup()
     (1 << CONFIG_ARDUINO_RUNNING_CORE),  
     true                                 
   };
+
   esp_task_wdt_init(&wdt_config);
   esp_task_wdt_add(NULL);
   Serial.printf("Task Watchdog Timer enabled with %d second timeout.\n", WDT_TIMEOUT_SEC);
