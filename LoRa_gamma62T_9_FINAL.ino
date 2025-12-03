@@ -413,9 +413,80 @@ void publishMQTTEvent()
 // --- PUSHOVER FUNCTIONS (MODIFIED for TLS) ---
 // ----------------------------------------------------
 
+// void sendPushover()
+// {
+//   Serial.println("Attempting Pushover notification...");
+  
+//   // *** TLS: Set the long-life Root CA for secure verification (removed insecure flag) ***
+//   secureClient.setCACert(PUSHOVER_ROOT_CA);
+  
+//   HTTPClient http;
+
+//   char url[URL_BUF_SIZE];
+//   snprintf(url, sizeof(url), "https://%s/1/messages.json", PUSHOVER_HOST);
+//   http.begin(secureClient, url); // Use the secureClient, which now has the CA
+//   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+//   http.setTimeout(4000); 
+
+//   char messageContent[MESSAGE_BUF_SIZE];
+//   const char* statusPrefix = (strcmp(current_data.status, "OPEN") == 0) ? "OPEN @ " : "CLOSED @ ";
+
+//   snprintf(messageContent, sizeof(messageContent), 
+//            "%s%s %.1f dBm %s (%.2f V)",
+//            statusPrefix,
+//            current_data.timestamp,
+//            current_data.rssi_dbm,
+//            current_data.batt_ok ? "OK" : "LOW",
+//            current_data.batt_voltage);
+
+//   char encodedMessage[POSTDATA_BUF_SIZE];
+//   urlEncode(messageContent, encodedMessage, sizeof(encodedMessage));
+
+//   char postData[POSTDATA_BUF_SIZE];
+//   int len = 0;
+  
+//   len += snprintf(postData + len, sizeof(postData) - len, "token=%s", PUSHOVER_TOKEN);
+//   len += snprintf(postData + len, sizeof(postData) - len, "&user=%s", PUSHOVER_USER);
+//   len += snprintf(postData + len, sizeof(postData) - len, "&device=%s", PUSHOVER_DEVICE);
+//   len += snprintf(postData + len, sizeof(postData) - len, "&message=%s", encodedMessage);
+
+//   Serial.printf("Pushover Post Data Length: %d\n", len);
+
+//   int httpResponseCode = http.POST(postData);
+
+//   if (httpResponseCode == 200)
+//   {  
+//     Serial.printf("Pushover success! Response Code: %d\n", httpResponseCode);
+//     Serial.println("--- INITIATING FLASH 2 (Red PO CONFIRM) ---");
+//     initBlink(LED_DRIVER_B, LED_DRIVER_A);
+
+//   }
+//   else if (httpResponseCode > 0)
+//   {
+//     Serial.printf("Pushover accepted, but response %d. NO RED FLASH.\n", httpResponseCode);
+//   }
+//   else
+//   {
+//     // The connection failed, likely due to a TLS error (bad time, bad CA, etc.)
+//     Serial.printf("Pushover failed. Error: %s (%d). NO RED FLASH.\n", http.errorToString(httpResponseCode).c_str(), httpResponseCode);
+//   }
+
+//   http.end();
+// }  
+
 void sendPushover()
 {
   Serial.println("Attempting Pushover notification...");
+  
+  // Determine which custom sound to use based on the gate status
+  const char* sound_to_use = "";
+  if (strcmp(current_data.status, "OPEN") == 0) {
+    // Uses the const char* PUSHOVER_SOUND_OPEN
+    sound_to_use = PUSHOVER_SOUND_OPEN; 
+  } else if (strcmp(current_data.status, "CLOSED") == 0) {
+    // Uses the const char* PUSHOVER_SOUND_CLOSED
+    sound_to_use = PUSHOVER_SOUND_CLOSED;
+  }
   
   // *** TLS: Set the long-life Root CA for secure verification (removed insecure flag) ***
   secureClient.setCACert(PUSHOVER_ROOT_CA);
@@ -424,13 +495,14 @@ void sendPushover()
 
   char url[URL_BUF_SIZE];
   snprintf(url, sizeof(url), "https://%s/1/messages.json", PUSHOVER_HOST);
-  http.begin(secureClient, url); // Use the secureClient, which now has the CA
+  http.begin(secureClient, url); 
   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
   http.setTimeout(4000); 
 
   char messageContent[MESSAGE_BUF_SIZE];
-  const char* statusPrefix = (strcmp(current_data.status, "OPEN") == 0) ? "OPEN @ " : "CLOSED @ ";
+  const char* statusPrefix = (strcmp(current_data.status, "OPEN") == 0) ? "Blue Gate OPEN @ " : "Blue Gate CLOSED @ ";
 
+  // Build the message content (which is URL-encoded later)
   snprintf(messageContent, sizeof(messageContent), 
            "%s%s %.1f dBm %s (%.2f V)",
            statusPrefix,
@@ -445,10 +517,19 @@ void sendPushover()
   char postData[POSTDATA_BUF_SIZE];
   int len = 0;
   
+  // 1. Mandatory Parameters
   len += snprintf(postData + len, sizeof(postData) - len, "token=%s", PUSHOVER_TOKEN);
   len += snprintf(postData + len, sizeof(postData) - len, "&user=%s", PUSHOVER_USER);
   len += snprintf(postData + len, sizeof(postData) - len, "&device=%s", PUSHOVER_DEVICE);
+  
+  // 2. Message Content
   len += snprintf(postData + len, sizeof(postData) - len, "&message=%s", encodedMessage);
+  
+  // 3. SOUND PARAMETER (NEW)
+  if (strlen(sound_to_use) > 0) {
+      Serial.printf("  -> Sending sound: %s\n", sound_to_use);
+      len += snprintf(postData + len, sizeof(postData) - len, "&sound=%s", sound_to_use);
+  }
 
   Serial.printf("Pushover Post Data Length: %d\n", len);
 
@@ -472,7 +553,7 @@ void sendPushover()
   }
 
   http.end();
-}  
+}
 
 // ----------------------------------------------------
 // --- NON-BLOCKING LED BLINK FUNCTIONS (Unmodified) ---
