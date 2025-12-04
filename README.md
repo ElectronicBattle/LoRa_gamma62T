@@ -27,3 +27,4 @@
 //The setup() function now checks and logs the reset reason, which is vital for diagnosing power or code issues.
 
 // Final Stable Version: Secure TLS, Non-Blocking, and Flash Optimized.
+// Deployed 3/12/25
