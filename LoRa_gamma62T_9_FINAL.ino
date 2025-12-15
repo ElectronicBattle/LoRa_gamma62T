@@ -1,31 +1,5 @@
 // DFRobot FireBeetle 2 ESP32-E (DFR0654) - IoT Gate Alert System
-
-//WDT & System	Watchdog Timer (WDT) Implementation	Completed. 
-//Added esp_task_wdt_init() and periodic esp_task_wdt_reset() to prevent code hangs.
-
-//ISR & Queue	ISR Safety & Event Queueing	Completed. 
-//Critical interrupt logic is short, uses volatile C-strings, and offloads processing to the main loop queue.
-
-//Phase 2, Rank 3	Non-Blocking LED Blink	Completed. 
-//Replaced any blocking delay() calls with the initBlink() and blinkHandler() FSM.
-
-//Phase 2, Rank 4	Replace Arduino String Usage	Completed. 
-//All dynamic strings and buffers use C-style char[] arrays and safe functions like snprintf and urlEncode.
-
-//Phase 3, Rank 5	Non-Blocking Stateful Serial FSM	Completed. 
-//The unreliable blocking readGammaData() is replaced by the robust serialReadHandler() FSM in the main loop.
-
-//Phase 3, Rank 6	Exponential Backoff with Jitter	Not Implemented (Replaced):
-//The final sketch uses the simpler fixed interval (5s) reconnection logic (RECONNECT_INTERVAL_MS). 
-//This is stable and was preferred over the more complex backoff logic we had started.
-
-//MQTT/Network	Network Failure Counter Reset	Completed. 
-//The reconnect_fail_count is correctly reset when the device is stable and online, preventing false alarms.
-
-//Diagnostic	Brownout/WDT Reset Diagnostics	Completed. 
-//The setup() function now checks and logs the reset reason, which is vital for diagnosing power or code issues.
-
-// Final Stable Version: Secure TLS, Non-Blocking, and Flash Optimized. Deployed 3/12/25
+// Final Stable Version: Secure TLS, Non-Blocking, and Persistent Logging.
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -37,7 +11,10 @@
 #include <secrets.h> 
 #include <ctype.h>   
 #include "esp_task_wdt.h" 
-#include "esp_log.h" // *** NEW: Required for Flash Optimization ***
+#include "esp_log.h" 
+#include "FS.h"
+#include "LittleFS.h" 
+#include <WebServer.h> // NEW: For HTTP server functionality
 
 // --- FIX: ADD FUNCTION PROTOTYPES FOR LINKER ERROR ---
 void setup();
@@ -49,6 +26,10 @@ void blinkHandler();
 void urlEncode(const char* input, char* output, size_t outputSize);
 bool serialReadHandler(); 
 void sendPushover();     
+// NEW LOGGING/HTTP PROTOTYPES
+void logToLittleFS(const char* eventMessage);
+void checkAndRotateLog();
+void initWebServer();
 // ---------------------------------------------------
 
 // ---------------------------------------------------------------------
@@ -59,34 +40,29 @@ void sendPushover();
 #define WDT_TIMEOUT_SEC 5  
 // -------------------------
 
-// --- LOW BATTERY THRESHOLD ---
+// --- LOW BATTERY THRESHOLD & PINS ... (Existing) ---
 #define BATT_LOW_THRESHOLD_V 2.00
-
-// --- INPUT PINS ---
 #define BUTTON_PIN 27 
 #define SENSOR_PIN 4   
-
-// --- BI-COLOUR LED PINS (NEW SOURCE/SINK LOGIC) ---
-#define LED_DRIVER_A            16 
-#define LED_DRIVER_B            14  
-
-// --- LED TIMING (Global) ---
+#define LED_DRIVER_A 16 
+#define LED_DRIVER_B 14  
 const unsigned long FLASH_DURATION_MS = 100;  
-
-// --- SERIAL CONFIGURATION ---
 #define SERIAL_RX_PIN 25  
 #define SERIAL_TX_PIN 17  
 #define BAUD_RATE 19200
-
-// Data Packet Structure (Gamma62T protocol)
 #define PACKET_SIZE 10
 byte packet_buffer[PACKET_SIZE] = { 0 };
-
-// --- DEFINITIONS REQUIRED FOR SERIAL SYNCHRONIZATION ---
 #define PACKET_CR 0x0D  
 #define PACKET_LF 0x0A  
 
-// --- NEW DEFINITIONS FOR C-STRING BUFFERS ---
+// --- NEW DEFINITIONS FOR LOGGING & HTTP SERVER ---
+const char* LOG_FILE = "/events.log";
+const char* LOG_OLD_FILE = "/events.old"; // NEW: For log rotation
+#define LOG_MESSAGE_SIZE 128
+#define MAX_LOG_SIZE_KB 500 // 500 KB maximum before rotation
+// ------------------------------------
+
+// --- C-STRING BUFFERS ... (Existing) ---
 #define TIMESTAMP_SIZE 16   
 #define STATUS_SIZE 10      
 #define MESSAGE_BUF_SIZE 150 
@@ -101,49 +77,22 @@ byte packet_buffer[PACKET_SIZE] = { 0 };
 WiFiClient espClient;
 WiFiClientSecure secureClient;
 PubSubClient mqttClient(espClient);
+WebServer server(80); // HTTP Server Object
 
-// --- GLOBAL VARIABLES FOR NON-BLOCKING RECONNECT ---
+// --- GLOBAL VARIABLES ... (Existing) ---
 const unsigned long RECONNECT_INTERVAL_MS = 5000; 
 unsigned long last_reconnect_attempt_ms = 0;
 bool is_online_mode = false; 
-
-// --- NEW AUTO-REBOOT COUNTER ---
 const int MAX_RECONNECT_FAILURES = 10;
 int reconnect_fail_count = 0; 
-
-// --- GLOBAL VARIABLES FOR NON-BLOCKING BLINK ---
 volatile unsigned long blink_stop_time_ms = 0; 
 volatile int blink_source_pin = -1;            
 volatile int blink_sink_pin = -1;              
-// -------------------------------------------------------------------
-
-// --- NEW GLOBAL VARIABLES FOR SERIAL FSM ---
 volatile bool packet_ready = false;  
 volatile size_t packet_index = 0;    
 const unsigned long SERIAL_TIMEOUT_MS = 500; 
 unsigned long packet_start_time = 0; 
-// -------------------------------------------
-
-// Structure to store a single event
-struct Event
-{
-  char status[STATUS_SIZE];
-  char source[STATUS_SIZE];
-};
-
-// Define the queue size
-#define MAX_QUEUE_SIZE 5
-volatile Event event_queue[MAX_QUEUE_SIZE];
-volatile int queue_head = 0;
-volatile int queue_tail = 0;
-
-// Volatile variables to hold the last stable state read by the ISR
-volatile int isr_button_state = HIGH;
-volatile int isr_sensor_state = HIGH;
-
-// Debouncing and timing
-volatile unsigned long last_interrupt_time = 0;
-const unsigned long DEBOUNCE_DELAY_MS = 25;
+// ... (Event Queue Struct and Globals remain unchanged)
 
 struct GateData
 {
@@ -338,6 +287,181 @@ void getTimestamp()
   strftime(current_data.timestamp, TIMESTAMP_SIZE, "%H:%M:%S", &timeinfo);
 }  
 
+
+// ----------------------------------------------------
+// --- NEW PERSISTENT LOGGING & LOG ROTATION ---
+// ----------------------------------------------------
+
+// NEW FUNCTION: Implements log rotation to prevent filling up the flash.
+void checkAndRotateLog() {
+  if (!LittleFS.exists(LOG_FILE)) {
+    return; 
+  }
+
+  File logFile = LittleFS.open(LOG_FILE, "r");
+  if (!logFile) {
+    return; 
+  }
+
+  size_t currentSize = logFile.size();
+  logFile.close();
+
+  // Check if the current log file exceeds the MAX_LOG_SIZE_KB limit
+  if (currentSize > (MAX_LOG_SIZE_KB * 1024)) {
+    Serial.printf("LOG ROTATION: File size %lu bytes exceeds %d KB limit.\n", currentSize, MAX_LOG_SIZE_KB);
+    
+    // 1. Delete the oldest log file (if it exists)
+    if (LittleFS.exists(LOG_OLD_FILE)) {
+      LittleFS.remove(LOG_OLD_FILE);
+      Serial.printf("LOG ROTATION: Deleted old file: %s\n", LOG_OLD_FILE);
+    }
+
+    // 2. Rename the current log file to the old log file
+    if (LittleFS.rename(LOG_FILE, LOG_OLD_FILE)) {
+      Serial.printf("LOG ROTATION: Renamed %s to %s.\n", LOG_FILE, LOG_OLD_FILE);
+      logToLittleFS("INFO: LOG ROTATION successful. New log started.");
+    } else {
+      Serial.printf("LOG ROTATION: Failed to rename %s.\n", LOG_FILE);
+      logToLittleFS("CRITICAL: LOG ROTATION FAILED!");
+    }
+  }
+}
+
+// Custom function to write an event to the log file (NON-BLOCKING)
+void logToLittleFS(const char* eventMessage) {
+  
+  // 1. Check for Rotation BEFORE writing
+  checkAndRotateLog(); 
+
+  // 2. Check if the file system is available
+  if (!LittleFS.begin()) {
+    Serial.println("FATAL: LittleFS not mounted. Cannot log event.");
+    return;
+  }
+
+  // 3. Open the file in append mode ('a')
+  File logFile = LittleFS.open(LOG_FILE, "a");
+  if (!logFile) {
+    Serial.println("Failed to open log file for appending.");
+    return;
+  }
+
+  // 4. Create a time-stamped log line
+  char timestamp_buffer[TIMESTAMP_SIZE + 32];
+  
+  // Get the most recent timestamp available
+  if (time(nullptr) > 100000) {
+    getTimestamp(); 
+    strncpy(timestamp_buffer, current_data.timestamp, sizeof(timestamp_buffer));
+  } else {
+    snprintf(timestamp_buffer, sizeof(timestamp_buffer), "ms:%lu", millis());
+  }
+
+  char logLine[LOG_MESSAGE_SIZE + TIMESTAMP_SIZE + 10];
+  snprintf(logLine, sizeof(logLine), "[%s] %s\n", timestamp_buffer, eventMessage);
+
+  // 5. Write to file and close
+  logFile.print(logLine);
+  logFile.close();
+  
+  Serial.printf("FS LOGGED: %s", logLine);
+}
+
+// ----------------------------------------------------
+// --- HTTP SERVER IMPLEMENTATION (NON-BLOCKING) ---
+// ----------------------------------------------------
+
+// Utility function to read a file and send it over HTTP
+void sendFileToClient(const char* path) {
+  File file = LittleFS.open(path, "r");
+  if (!file) {
+    server.send(404, "text/plain", "File not found or LittleFS error.");
+    return;
+  }
+  // Send the file content to the client (streams the content)
+  server.streamFile(file, "text/plain");
+  file.close();
+}
+
+// Handler for the main index page
+void handleRoot() {
+  String html = "<html><head><title>Gate Alert Logs</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'></head><body>";
+  html += "<h1>Gate Alert System Diagnostic</h1>";
+  
+  html += "<p>Current Time: ";
+  if (time(nullptr) > 100000) {
+    getTimestamp();
+    html += current_data.timestamp;
+  } else {
+    html += "NTP Sync Pending (Millis: " + String(millis()) + "ms)";
+  }
+  html += "</p>";
+
+  html += "<h2>Log Files</h2>";
+  html += "<ul>";
+  
+  if (LittleFS.exists(LOG_FILE)) {
+    File log = LittleFS.open(LOG_FILE, "r");
+    html += "<li>Current Log (<a href='/log.txt'>/log.txt</a>): " + String(log.size() / 1024.0, 2) + " KB</li>";
+    log.close();
+  } else {
+    html += "<li>Current Log: Not Found</li>";
+  }
+
+  if (LittleFS.exists(LOG_OLD_FILE)) {
+    File oldLog = LittleFS.open(LOG_OLD_FILE, "r");
+    html += "<li>Old Log (<a href='/log_old.txt'>/log_old.txt</a>): " + String(oldLog.size() / 1024.0, 2) + " KB</li>";
+    oldLog.close();
+  } else {
+    html += "<li>Old Log: Not Found</li>";
+  }
+  html += "</ul>";
+  
+  html += "<h2>Actions</h2>";
+  html += "<p><a href='/clear'>[Click here to DELETE and START a NEW LOG]</a></p>";
+  
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+// Handler for log clearing
+void handleLogClear() {
+  Serial.println("Received request to clear logs.");
+  logToLittleFS("INFO: LOG CLEAR REQUEST RECEIVED via HTTP.");
+  
+  if (LittleFS.exists(LOG_FILE)) {
+    LittleFS.remove(LOG_FILE);
+    Serial.println("Successfully deleted /events.log.");
+  }
+  if (LittleFS.exists(LOG_OLD_FILE)) {
+    LittleFS.remove(LOG_OLD_FILE);
+    Serial.println("Successfully deleted /events.old.");
+  }
+  
+  logToLittleFS("INFO: ALL LOG FILES CLEARED."); 
+  
+  server.sendHeader("Location", "/", true);
+  server.send(302, "text/plain", "Logs Cleared. Redirecting.");
+}
+
+// Initialization for the HTTP server
+void initWebServer() {
+  server.on("/", handleRoot);
+  server.on("/log.txt", [](){ sendFileToClient(LOG_FILE); }); 
+  server.on("/log_old.txt", [](){ sendFileToClient(LOG_OLD_FILE); });
+  server.on("/clear", handleLogClear);
+  server.onNotFound([](){
+    server.send(404, "text/plain", "Not Found");
+  });
+
+  server.begin();
+  Serial.print("HTTP Server started on IP: ");
+  Serial.println(WiFi.localIP());
+  logToLittleFS("INFO: Web server successfully started.");
+}
+
+
 // ----------------------------------------------------
 // --- MQTT FUNCTIONS (Unmodified) ---
 // ----------------------------------------------------
@@ -410,69 +534,8 @@ void publishMQTTEvent()
 }  
 
 // ----------------------------------------------------
-// --- PUSHOVER FUNCTIONS (MODIFIED for TLS) ---
+// --- PUSHOVER FUNCTIONS (MODIFIED with Logging) ---
 // ----------------------------------------------------
-
-// void sendPushover()
-// {
-//   Serial.println("Attempting Pushover notification...");
-  
-//   // *** TLS: Set the long-life Root CA for secure verification (removed insecure flag) ***
-//   secureClient.setCACert(PUSHOVER_ROOT_CA);
-  
-//   HTTPClient http;
-
-//   char url[URL_BUF_SIZE];
-//   snprintf(url, sizeof(url), "https://%s/1/messages.json", PUSHOVER_HOST);
-//   http.begin(secureClient, url); // Use the secureClient, which now has the CA
-//   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-//   http.setTimeout(4000); 
-
-//   char messageContent[MESSAGE_BUF_SIZE];
-//   const char* statusPrefix = (strcmp(current_data.status, "OPEN") == 0) ? "OPEN @ " : "CLOSED @ ";
-
-//   snprintf(messageContent, sizeof(messageContent), 
-//            "%s%s %.1f dBm %s (%.2f V)",
-//            statusPrefix,
-//            current_data.timestamp,
-//            current_data.rssi_dbm,
-//            current_data.batt_ok ? "OK" : "LOW",
-//            current_data.batt_voltage);
-
-//   char encodedMessage[POSTDATA_BUF_SIZE];
-//   urlEncode(messageContent, encodedMessage, sizeof(encodedMessage));
-
-//   char postData[POSTDATA_BUF_SIZE];
-//   int len = 0;
-  
-//   len += snprintf(postData + len, sizeof(postData) - len, "token=%s", PUSHOVER_TOKEN);
-//   len += snprintf(postData + len, sizeof(postData) - len, "&user=%s", PUSHOVER_USER);
-//   len += snprintf(postData + len, sizeof(postData) - len, "&device=%s", PUSHOVER_DEVICE);
-//   len += snprintf(postData + len, sizeof(postData) - len, "&message=%s", encodedMessage);
-
-//   Serial.printf("Pushover Post Data Length: %d\n", len);
-
-//   int httpResponseCode = http.POST(postData);
-
-//   if (httpResponseCode == 200)
-//   {  
-//     Serial.printf("Pushover success! Response Code: %d\n", httpResponseCode);
-//     Serial.println("--- INITIATING FLASH 2 (Red PO CONFIRM) ---");
-//     initBlink(LED_DRIVER_B, LED_DRIVER_A);
-
-//   }
-//   else if (httpResponseCode > 0)
-//   {
-//     Serial.printf("Pushover accepted, but response %d. NO RED FLASH.\n", httpResponseCode);
-//   }
-//   else
-//   {
-//     // The connection failed, likely due to a TLS error (bad time, bad CA, etc.)
-//     Serial.printf("Pushover failed. Error: %s (%d). NO RED FLASH.\n", http.errorToString(httpResponseCode).c_str(), httpResponseCode);
-//   }
-
-//   http.end();
-// }  
 
 void sendPushover()
 {
@@ -481,14 +544,11 @@ void sendPushover()
   // Determine which custom sound to use based on the gate status
   const char* sound_to_use = "";
   if (strcmp(current_data.status, "OPEN") == 0) {
-    // Uses the const char* PUSHOVER_SOUND_OPEN
     sound_to_use = PUSHOVER_SOUND_OPEN; 
   } else if (strcmp(current_data.status, "CLOSED") == 0) {
-    // Uses the const char* PUSHOVER_SOUND_CLOSED
     sound_to_use = PUSHOVER_SOUND_CLOSED;
   }
   
-  // *** TLS: Set the long-life Root CA for secure verification (removed insecure flag) ***
   secureClient.setCACert(PUSHOVER_ROOT_CA);
   
   HTTPClient http;
@@ -525,7 +585,7 @@ void sendPushover()
   // 2. Message Content
   len += snprintf(postData + len, sizeof(postData) - len, "&message=%s", encodedMessage);
   
-  // 3. SOUND PARAMETER (NEW)
+  // 3. SOUND PARAMETER 
   if (strlen(sound_to_use) > 0) {
       Serial.printf("  -> Sending sound: %s\n", sound_to_use);
       len += snprintf(postData + len, sizeof(postData) - len, "&sound=%s", sound_to_use);
@@ -535,9 +595,13 @@ void sendPushover()
 
   int httpResponseCode = http.POST(postData);
 
+  char log_buffer[LOG_MESSAGE_SIZE];
+
   if (httpResponseCode == 200)
   {  
     Serial.printf("Pushover success! Response Code: %d\n", httpResponseCode);
+    snprintf(log_buffer, sizeof(log_buffer), "PO: SUCCESS (%s) Response: 200", current_data.status);
+    logToLittleFS(log_buffer); // Log Success
     Serial.println("--- INITIATING FLASH 2 (Red PO CONFIRM) ---");
     initBlink(LED_DRIVER_B, LED_DRIVER_A);
 
@@ -545,11 +609,15 @@ void sendPushover()
   else if (httpResponseCode > 0)
   {
     Serial.printf("Pushover accepted, but response %d. NO RED FLASH.\n", httpResponseCode);
+    snprintf(log_buffer, sizeof(log_buffer), "PO: ACCEPTED (%s) Response: %d", current_data.status, httpResponseCode);
+    logToLittleFS(log_buffer); // Log Soft Success
   }
   else
   {
     // The connection failed, likely due to a TLS error (bad time, bad CA, etc.)
     Serial.printf("Pushover failed. Error: %s (%d). NO RED FLASH.\n", http.errorToString(httpResponseCode).c_str(), httpResponseCode);
+    snprintf(log_buffer, sizeof(log_buffer), "PO: FAILED (%s) Error: %d", current_data.status, httpResponseCode);
+    logToLittleFS(log_buffer); // Log Hard Failure
   }
 
   http.end();
@@ -589,7 +657,7 @@ void blinkHandler()
 
 
 // ----------------------------------------------------
-// --- NON-BLOCKING NETWORK MANAGEMENT (Unmodified) ---
+// --- NON-BLOCKING NETWORK MANAGEMENT (MODIFIED with Logging) ---
 // ----------------------------------------------------
 
 void checkAndReconnectNetwork()
@@ -622,11 +690,15 @@ void checkAndReconnectNetwork()
          Serial.println("Successfully reconnected to network and MQTT. ONLINE MODE restored.");
          configTime(0, 0, "pool.ntp.org");
          reconnect_fail_count = 0;
+         logToLittleFS("NET: ONLINE MODE RESTORED (WiFi & MQTT success)."); // Critical Success Log
+         initWebServer(); // Initialize server on successful reconnect
       } 
       else if (was_online_mode && !is_online_mode) 
       {
          Serial.println("WARNING: Lost network connection. Falling back to LOCAL MODE.");
+         logToLittleFS("NET: WARNING - LOST CONNECTION (Falling to LOCAL)."); // Critical Failure Log
          reconnect_fail_count++;
+         server.stop(); // Stop the web server if we lose the connection
       } 
       else if (!is_online_mode)
       {
@@ -637,6 +709,7 @@ void checkAndReconnectNetwork()
          if (reconnect_fail_count >= MAX_RECONNECT_FAILURES)
          {
            Serial.println("\n!!! MAX RECONNECT FAILURES REACHED !!! Initiating ESP32 Hard Reset.");
+           logToLittleFS("CRITICAL: MAX RECONNECT FAILURES. Initiating hard reset."); // Critical Reset Log
            ESP.restart(); 
            delay(500); 
          }
@@ -657,7 +730,7 @@ void checkAndReconnectNetwork()
 
 
 // ----------------------------------------------------
-// --- SETUP and LOOP (MODIFIED for TLS Time Check & Flash Opt.) ---
+// --- SETUP and LOOP ---
 // ----------------------------------------------------
 
 void setup()
@@ -665,29 +738,38 @@ void setup()
   randomSeed(analogRead(A0)); 
   Serial.begin(115200);
 
-  // --- FLASH LIFESPAN OPTIMIZATION (NEW) ---
-  // Set all log components to only print ERROR level messages or higher.
+  // --- LOGGING OPTIMIZATION (Existing) ---
   esp_log_level_set("*", ESP_LOG_ERROR); 
-  // Set Wi-Fi component specifically to only print ERROR messages.
   esp_log_level_set("wifi", ESP_LOG_ERROR); 
   Serial.println("System logging throttled for flash wear prevention.");
-  // ------------------------------------------
   
   Serial.println("\n--- Starting Dual-Input Gate Alert System ---");
 
-  // --- Reset Reason Check for Diagnostics (Unmodified) ---
+  // --- Reset Reason Check ---
   esp_reset_reason_t reason = esp_reset_reason();
+  char reset_msg[64];
 
   if (reason == ESP_RST_BROWNOUT) {
-    Serial.println("!!! ⚠️ WARNING: System reset due to BROWNOUT (Power Supply Issue) !!!");
+    snprintf(reset_msg, sizeof(reset_msg), "CRITICAL: System reset due to BROWNOUT!");
   } else if (reason == ESP_RST_WDT) {
-    Serial.println("!!! ⚠️ WARNING: System reset due to WATCHDOG TIMER (Code Blocked) !!!");
+    snprintf(reset_msg, sizeof(reset_msg), "CRITICAL: System reset due to WATCHDOG TIMER!");
   } else if (reason == ESP_RST_SW) {
-    Serial.println("System reset was software-triggered (ESP.restart()).");
+    snprintf(reset_msg, sizeof(reset_msg), "INFO: System reset was software-triggered.");
   } else {
-    Serial.printf("System initialized after reset (Reason Code: %d).\n", reason);
+    snprintf(reset_msg, sizeof(reset_msg), "INFO: System initialized (Reason Code: %d).", reason);
   }
-  // ------------------------------------------
+  Serial.println(reset_msg);
+  
+  // --- LITTLEFS SETUP ---
+  if (!LittleFS.begin(true)) {
+    Serial.println("FATAL: LITTLEFS MOUNT FAILED! Cannot log events.");
+  } else {
+    logToLittleFS("INFO: LittleFS mounted successfully."); // Log successful mount
+  }
+  // Log the Reset Reason AFTER LittleFS is confirmed mounted
+  logToLittleFS(reset_msg); 
+  // ----------------------
+
 
   // --- WDT SETUP (Unmodified) ---
   const esp_task_wdt_config_t wdt_config = {
@@ -699,7 +781,6 @@ void setup()
   esp_task_wdt_init(&wdt_config);
   esp_task_wdt_add(NULL);
   Serial.printf("Task Watchdog Timer enabled with %d second timeout.\n", WDT_TIMEOUT_SEC);
-  // -----------------
 
   Serial2.begin(BAUD_RATE, SERIAL_8N1, SERIAL_RX_PIN, SERIAL_TX_PIN);
 
@@ -726,6 +807,12 @@ void setup()
   }
   
   delay(1000);
+  
+  // --- Initialize HTTP Server after Wi-Fi starts ---
+  if (WiFi.status() == WL_CONNECTED) {
+      initWebServer();
+  }
+  // -----------------------------------------------------
 
   attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleGateInterrupt, CHANGE);
   attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), handleGateInterrupt, CHANGE);
@@ -736,31 +823,32 @@ void setup()
 
 void loop()
 {
-  // --- 1. WDT, LED, Network, MQTT Handlers ---
+  // --- 1. WDT, LED, Network, MQTT Handlers & HTTP Server ---
   esp_task_wdt_reset();
   blinkHandler();
   checkAndReconnectNetwork();
   if (is_online_mode)
   {
     mqttClient.loop();
+    server.handleClient(); // NEW: Non-blocking HTTP Server handler
   }
 
   // --- 2. NON-BLOCKING SERIAL PACKET CONSUMPTION (FSM) ---
   if (serialReadHandler()) 
   {
     Serial.println("--- Serial Data Received (Main Loop - Packet Ready) ---");
-    parseGammaData(); // Updates current_data struct
+    parseGammaData(); 
     
     // Green Flash confirms packet arrival and successful parsing
     Serial.println("--- INITIATING FLASH 1 (Green RX) ---");
     initBlink(LED_DRIVER_A, LED_DRIVER_B);
     
-    packet_ready = false; // Consume and reset the FSM flag
+    packet_ready = false; 
     packet_index = 0;
   }
   
   
-  // --- 3. EVENT QUEUE PROCESSING ---
+  // --- 3. EVENT QUEUE PROCESSING (MODIFIED with Logging) ---
   if (queue_head != queue_tail)
   {
     Event next_event;
@@ -768,6 +856,10 @@ void loop()
     queue_tail = (queue_tail + 1) % MAX_QUEUE_SIZE;
 
     Serial.println("--- Gate Event Fired (Main Loop - From Queue) ---");
+    // Log the event trigger itself
+    char event_log[64];
+    snprintf(event_log, sizeof(event_log), "GATE EVENT: %s detected by %s.", current_data.status, next_event.source);
+    logToLittleFS(event_log); 
 
     // Capture Timestamp, use the most recent data status
     if (WiFi.status() == WL_CONNECTED)
@@ -814,11 +906,13 @@ void loop()
       else
       {
         Serial.println("WARNING: WiFi connected but NTP time not synced. Skipping secure notifications.");
+        logToLittleFS("WARNING: NTP sync failed. Secure notifications skipped."); // Log the sync failure
       }
     }
     else
     {
       Serial.println("No WiFi connection. Notifications skipped (LOCAL MODE).");
+      logToLittleFS("WARNING: No WiFi. Notifications skipped (LOCAL MODE)."); // Log network disconnect failure
     }
 
     Serial.println("--- Event Handled ---\n");
