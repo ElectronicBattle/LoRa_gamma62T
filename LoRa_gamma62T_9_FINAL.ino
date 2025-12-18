@@ -17,7 +17,7 @@
 #include "LittleFS.h" 
 #include <WebServer.h> 
 
-// --- FUNCTION PROTOTYPES ---
+// --- FIX: ADD FUNCTION PROTOTYPES FOR LINKER ERROR ---
 void setup();
 void loop();
 void reconnectMQTT();
@@ -31,7 +31,7 @@ void logToLittleFS(const char* eventMessage);
 void checkAndRotateLog();
 void initWebServer();
 
-// --- HARDWARE & CONFIGURATION ---
+// --- HARDWARE & SERIAL CONFIGURATION ---
 #define WDT_TIMEOUT_SEC 5  
 #define BATT_LOW_THRESHOLD_V 2.00
 #define BUTTON_PIN 27 
@@ -64,12 +64,12 @@ WiFiClientSecure secureClient;
 PubSubClient mqttClient(espClient);
 WebServer server(80); 
 
-// --- RESILIENCE VARIABLES ---
+// --- NETWORK RESILIENCE VARIABLES ---
 const unsigned long RECONNECT_INTERVAL_MS = 5000; 
 unsigned long last_reconnect_attempt_ms = 0;
 bool is_online_mode = false; 
 
-// NEW: 30s Grace Period for Network Stability
+// NEW: 30s Grace Period variables
 unsigned long last_wifi_ok_ms = 0;
 const unsigned long WIFI_GRACE_PERIOD_MS = 30000;
 
@@ -112,35 +112,30 @@ struct GateData {
   bool data_valid = false;
 } current_data;
 
-// --- INTERRUPT HANDLER ---
+// --- INTERRUPT HANDLER (Unchanged) ---
 void IRAM_ATTR handleGateInterrupt() {
   unsigned long interrupt_time = millis();
   int current_btn = digitalRead(BUTTON_PIN);
   int current_sensor = digitalRead(SENSOR_PIN);
-
   if (interrupt_time - last_interrupt_time > DEBOUNCE_DELAY_MS) {
     bool btn_changed = (current_btn != isr_button_state);
     bool sensor_changed = (current_sensor != isr_sensor_state);
-
     if (btn_changed || sensor_changed) {
       if (((queue_head + 1) % MAX_QUEUE_SIZE) != queue_tail) {
         const char* new_status;
         const char* new_source;
-
         if (sensor_changed) {
           new_status = (current_sensor == LOW) ? "OPEN" : "CLOSED";
           new_source = "SENSOR";
-        } else {
+        } else if (btn_changed) {
           new_status = (current_btn == LOW) ? "CLOSED" : "OPEN";
           new_source = "BUTTON";
         }
-
         volatile Event* current_event = &event_queue[queue_head];
         strncpy((char*)current_event->status, new_status, STATUS_SIZE - 1);
         current_event->status[STATUS_SIZE - 1] = '\0'; 
         strncpy((char*)current_event->source, new_source, STATUS_SIZE - 1);
         current_event->source[STATUS_SIZE - 1] = '\0';
-
         queue_head = (queue_head + 1) % MAX_QUEUE_SIZE;
         last_interrupt_time = interrupt_time;
         isr_button_state = current_btn;
@@ -170,9 +165,11 @@ void urlEncode(const char* input, char* output, size_t outputSize) {
   output[encoded_index] = '\0'; 
 }
 
+// RESTORED: Full Gold Narrative for Serial Handler
 bool serialReadHandler() {
   if (packet_ready) return true; 
   if (packet_index > 0 && millis() - packet_start_time > SERIAL_TIMEOUT_MS) {
+    Serial.printf("Serial Timeout: Packet incomplete after %lu ms. Resetting parser.\n", SERIAL_TIMEOUT_MS);
     while(Serial2.available()) Serial2.read(); 
     packet_index = 0; 
     return false;
@@ -183,9 +180,15 @@ bool serialReadHandler() {
     packet_buffer[packet_index++] = incoming_byte;
     if (packet_index == PACKET_SIZE) {
       if (packet_buffer[PACKET_SIZE - 2] == PACKET_CR && packet_buffer[PACKET_SIZE - 1] == PACKET_LF) {
+        Serial.println("Packet synchronized successfully (Non-Blocking FSM).");
+        Serial.print("Raw Packet Data (FSM Success): ");
+        for (int i = 0; i < PACKET_SIZE; i++) Serial.printf("%02X ", packet_buffer[i]);
+        Serial.println();
         packet_ready = true;
         return true; 
       } else {
+        Serial.printf("Sync Failed: Expected CR/LF, found 0x%02X, 0x%02X. Attempting shift resync.\n",
+                      packet_buffer[PACKET_SIZE - 2], packet_buffer[PACKET_SIZE - 1]);
         for (int i = 1; i < PACKET_SIZE; i++) packet_buffer[i - 1] = packet_buffer[i];
         packet_index = PACKET_SIZE - 1; 
       }
@@ -221,22 +224,33 @@ void checkAndRotateLog() {
   size_t currentSize = logFile.size();
   logFile.close();
   if (currentSize > (MAX_LOG_SIZE_KB * 1024)) {
-    if (LittleFS.exists(LOG_OLD_FILE)) LittleFS.remove(LOG_OLD_FILE);
+    Serial.printf("LOG ROTATION: File size %lu bytes exceeds %d KB limit.\n", currentSize, MAX_LOG_SIZE_KB);
+    if (LittleFS.exists(LOG_OLD_FILE)) {
+        LittleFS.remove(LOG_OLD_FILE);
+        Serial.printf("LOG ROTATION: Deleted old file: %s\n", LOG_OLD_FILE);
+    }
     if (LittleFS.rename(LOG_FILE, LOG_OLD_FILE)) {
-      logToLittleFS("INFO: LOG ROTATION successful.");
+      Serial.printf("LOG ROTATION: Renamed %s to %s.\n", LOG_FILE, LOG_OLD_FILE);
+      logToLittleFS("INFO: LOG ROTATION successful. New log started.");
     }
   }
 }
 
 void logToLittleFS(const char* eventMessage) {
   checkAndRotateLog(); 
-  if (!LittleFS.begin()) return;
+  if (!LittleFS.begin()) {
+    Serial.println("FATAL: LittleFS not mounted. Cannot log event.");
+    return;
+  }
   File logFile = LittleFS.open(LOG_FILE, "a");
-  if (!logFile) return;
+  if (!logFile) {
+    Serial.println("Failed to open log file for appending.");
+    return;
+  }
   char timestamp_buffer[TIMESTAMP_SIZE + 32];
   if (time(nullptr) > 100000) {
     getTimestamp(); 
-    strncpy(timestamp_buffer, (const char*)current_data.timestamp, sizeof(timestamp_buffer)); // CAST FOR CORE 3.x
+    strncpy(timestamp_buffer, (const char*)current_data.timestamp, sizeof(timestamp_buffer)); // CORE 3.x FIX
   } else {
     snprintf(timestamp_buffer, sizeof(timestamp_buffer), "ms:%lu", millis());
   }
@@ -244,9 +258,10 @@ void logToLittleFS(const char* eventMessage) {
   snprintf(logLine, sizeof(logLine), "[%s] %s\n", timestamp_buffer, eventMessage);
   logFile.print(logLine);
   logFile.close();
+  Serial.printf("FS LOGGED: %s", logLine);
 }
 
-// --- WEB SERVER ---
+// --- HTTP SERVER ---
 void sendFileToClient(const char* path) {
   File file = LittleFS.open(path, "r");
   if (!file) { server.send(404, "text/plain", "File not found."); return; }
@@ -255,27 +270,33 @@ void sendFileToClient(const char* path) {
 }
 
 void handleRoot() {
-  String html = "<html><body><h1>Gate Alert System Diagnostic</h1>";
+  String html = "<html><head><title>Gate Alert Logs</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'></head><body>";
+  html += "<h1>Gate Alert System Diagnostic</h1>";
   html += "<p>Current Time: ";
   if (time(nullptr) > 100000) {
     getTimestamp();
-    html += (const char*)current_data.timestamp; // CAST FOR CORE 3.x
+    html += (const char*)current_data.timestamp; // CORE 3.x FIX
   } else {
     html += "NTP Sync Pending (Millis: " + String(millis()) + "ms)";
   }
   html += "</p><h2>Log Files</h2><ul>";
   if (LittleFS.exists(LOG_FILE)) {
     File log = LittleFS.open(LOG_FILE, "r");
-    html += "<li><a href='/log.txt'>/log.txt</a>: " + String(log.size() / 1024.0, 2) + " KB</li>";
+    html += "<li>Current Log (<a href='/log.txt'>/log.txt</a>): " + String(log.size() / 1024.0, 2) + " KB</li>";
     log.close();
   }
-  html += "</ul></body></html>";
+  html += "</ul><h2>Actions</h2><p><a href='/clear'>[Click here to DELETE and START a NEW LOG]</a></p>";
+  html += "</body></html>";
   server.send(200, "text/html", html);
 }
 
 void handleLogClear() {
+  Serial.println("Received request to clear logs.");
+  logToLittleFS("INFO: LOG CLEAR REQUEST RECEIVED via HTTP.");
   if (LittleFS.exists(LOG_FILE)) LittleFS.remove(LOG_FILE);
   if (LittleFS.exists(LOG_OLD_FILE)) LittleFS.remove(LOG_OLD_FILE);
+  logToLittleFS("INFO: ALL LOG FILES CLEARED."); 
   server.sendHeader("Location", "/", true);
   server.send(302, "text/plain", "Cleared.");
 }
@@ -285,14 +306,21 @@ void initWebServer() {
   server.on("/log.txt", [](){ sendFileToClient(LOG_FILE); }); 
   server.on("/clear", handleLogClear);
   server.begin();
+  Serial.print("HTTP Server started on IP: ");
+  Serial.println(WiFi.localIP());
   logToLittleFS("INFO: Web server successfully started.");
 }
 
 // --- MQTT ---
 void reconnectMQTT() {
   if (WiFi.status() != WL_CONNECTED) return;
+  Serial.print("Attempting MQTT connection (Single attempt)...");
   if (mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS)) {
-    Serial.println("MQTT Connected");
+    Serial.println("connected");
+  } else {
+    Serial.print("failed, rc=");
+    Serial.print(mqttClient.state());
+    Serial.println(" (Failed attempt)");
   }
 }  
 
@@ -302,6 +330,7 @@ void publishMQTTSimpleValue(const char* topicSuffix, float value, int precision,
   snprintf(fullTopic, sizeof(fullTopic), "home/blue_gate/%s", topicSuffix);
   dtostrf(value, 0, precision, floatPayload);
   snprintf(textPayload, sizeof(textPayload), "%s: %s %s", topicSuffix, floatPayload, unit);
+  Serial.printf("Publishing to %s: %s\n", fullTopic, textPayload);
   mqttClient.publish(fullTopic, textPayload, false);
 }  
 
@@ -312,8 +341,11 @@ void publishMQTTEvent() {
   doc["gate_status"] = current_data.status;
   doc["data_valid"] = current_data.data_valid;
   if (current_data.data_valid) doc["battery_ok"] = current_data.batt_ok;
+  else doc["error"] = "Serial data read failed";
   char jsonBuffer[256];
   serializeJson(doc, jsonBuffer);
+  Serial.print("Publishing JSON to MQTT: ");
+  Serial.println(jsonBuffer);
   mqttClient.publish(MQTT_TOPIC_STATUS, jsonBuffer, true);
   if (current_data.data_valid) {
     publishMQTTSimpleValue("RSSI_dBm", current_data.rssi_dbm, 1, "dBm");
@@ -321,8 +353,9 @@ void publishMQTTEvent() {
   }
 }  
 
-// --- PUSHOVER (Restored Gold with Sound) ---
+// RESTORED: Full Gold Narrative for Pushover
 void sendPushover() {
+  Serial.println("Attempting Pushover notification...");
   const char* sound_to_use = "";
   if (strcmp(current_data.status, "OPEN") == 0) sound_to_use = PUSHOVER_SOUND_OPEN; 
   else if (strcmp(current_data.status, "CLOSED") == 0) sound_to_use = PUSHOVER_SOUND_CLOSED;
@@ -348,14 +381,31 @@ void sendPushover() {
   int len = 0;
   len += snprintf(postData + len, sizeof(postData) - len, "token=%s&user=%s&device=%s&message=%s", 
                   PUSHOVER_TOKEN, PUSHOVER_USER, PUSHOVER_DEVICE, encodedMessage);
-  if (strlen(sound_to_use) > 0) len += snprintf(postData + len, sizeof(postData) - len, "&sound=%s", sound_to_use);
+  
+  if (strlen(sound_to_use) > 0) {
+      Serial.printf("  -> Sending sound: %s\n", sound_to_use);
+      len += snprintf(postData + len, sizeof(postData) - len, "&sound=%s", sound_to_use);
+  }
+
+  Serial.printf("Pushover Post Data Length: %d\n", len);
 
   int httpResponseCode = http.POST(postData);
   char log_buffer[LOG_MESSAGE_SIZE];
+
   if (httpResponseCode == 200) {  
-    snprintf(log_buffer, sizeof(log_buffer), "PO: SUCCESS (%s)", current_data.status);
+    Serial.printf("Pushover success! Response Code: %d\n", httpResponseCode);
+    snprintf(log_buffer, sizeof(log_buffer), "PO: SUCCESS (%s) Response: 200", current_data.status);
     logToLittleFS(log_buffer); 
-    initBlink(LED_DRIVER_B, LED_DRIVER_A); // RED FLASH
+    Serial.println("--- INITIATING FLASH 2 (Red PO CONFIRM) ---");
+    initBlink(LED_DRIVER_B, LED_DRIVER_A);
+  } else if (httpResponseCode > 0) {
+    Serial.printf("Pushover accepted, but response %d. NO RED FLASH.\n", httpResponseCode);
+    snprintf(log_buffer, sizeof(log_buffer), "PO: ACCEPTED (%s) Response: %d", current_data.status, httpResponseCode);
+    logToLittleFS(log_buffer);
+  } else {
+    Serial.printf("Pushover failed. Error: %s (%d). NO RED FLASH.\n", http.errorToString(httpResponseCode).c_str(), httpResponseCode);
+    snprintf(log_buffer, sizeof(log_buffer), "PO: FAILED (%s) Error: %d", current_data.status, httpResponseCode);
+    logToLittleFS(log_buffer);
   }
   http.end();
 }
@@ -371,10 +421,11 @@ void blinkHandler() {
   if (blink_source_pin != -1 && millis() >= blink_stop_time_ms) {
     digitalWrite(blink_source_pin, LOW); digitalWrite(blink_sink_pin, LOW);
     blink_source_pin = -1; blink_sink_pin = -1;
+    Serial.println("LED blink finished (non-blocking).");
   }
 } 
 
-// --- NETWORK MANAGEMENT (MODIFIED: Grace Period & Surgical Reconnect) ---
+// --- NETWORK MANAGEMENT (MODIFIED: Grace Period) ---
 void checkAndReconnectNetwork() {
   unsigned long currentMillis = millis();
   bool currently_connected = (WiFi.status() == WL_CONNECTED && mqttClient.connected());
@@ -384,9 +435,9 @@ void checkAndReconnectNetwork() {
     is_online_mode = true;
     reconnect_fail_count = 0;
   } else {
-    // Grace Period: Stay in "Online Mode" for 30s before logging failure
     if (currentMillis - last_wifi_ok_ms > WIFI_GRACE_PERIOD_MS) {
       if (is_online_mode) {
+        Serial.println("WARNING: Lost network connection. Falling back to LOCAL MODE.");
         logToLittleFS("NET: WARNING - LOST CONNECTION (Falling to LOCAL).");
         is_online_mode = false;
         server.stop();
@@ -394,17 +445,23 @@ void checkAndReconnectNetwork() {
     }
     
     if (currentMillis - last_reconnect_attempt_ms >= RECONNECT_INTERVAL_MS) {
+      Serial.println("\n--- Non-Blocking Reconnection Attempt Triggered ---");
       last_reconnect_attempt_ms = currentMillis; 
-      if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
+      if (WiFi.status() != WL_CONNECTED) {
+          Serial.print("Attempting Wi-Fi reconnect...");
+          WiFi.reconnect();
+      }
       if (WiFi.status() == WL_CONNECTED && !mqttClient.connected()) reconnectMQTT();
       
       if (WiFi.status() == WL_CONNECTED && mqttClient.connected()) {
         if (!is_online_mode) {
+           Serial.println("Successfully reconnected. ONLINE MODE restored.");
            logToLittleFS("NET: ONLINE MODE RESTORED.");
            initWebServer();
         }
       } else {
         reconnect_fail_count++;
+        Serial.printf("Failure count: %d/%d\n", reconnect_fail_count, MAX_RECONNECT_FAILURES);
         if (reconnect_fail_count >= MAX_RECONNECT_FAILURES) ESP.restart();
       }
     }
@@ -413,9 +470,13 @@ void checkAndReconnectNetwork() {
 
 void setup() {
   Serial.begin(115200);
-  LittleFS.begin(true);
-  
-  // 1. NTP Initialization with Multiple Sources
+  esp_log_level_set("*", ESP_LOG_ERROR);
+  Serial.println("\n--- Starting Dual-Input Gate Alert System ---");
+
+  if (!LittleFS.begin(true)) Serial.println("FATAL: LITTLEFS MOUNT FAILED!");
+  else logToLittleFS("INFO: LittleFS mounted successfully.");
+
+  // 1. NTP Initialization with Multiple Sources (Improved Resilience)
   configTime(0, 0, "192.168.1.1", "ntp1.npl.co.uk", "pool.ntp.org");
   
   pinMode(BUTTON_PIN, INPUT_PULLUP);
@@ -449,15 +510,17 @@ void loop() {
     server.handleClient();
   }
 
-  // FORCE NTP SYNC (Background Retry)
+  // FORCE NTP SYNC (Background Retry if not synced)
   if (time(nullptr) < 100000 && (millis() - last_ntp_sync_attempt_ms > NTP_RETRY_INTERVAL_MS)) {
     last_ntp_sync_attempt_ms = millis();
     configTime(0, 0, "192.168.1.1", "ntp1.npl.co.uk", "pool.ntp.org");
   }
 
   if (serialReadHandler()) {
+    Serial.println("--- Serial Data Received (Main Loop - Packet Ready) ---");
     parseGammaData(); 
-    initBlink(LED_DRIVER_A, LED_DRIVER_B); // GREEN FLASH
+    Serial.println("--- INITIATING FLASH 1 (Green RX) ---");
+    initBlink(LED_DRIVER_A, LED_DRIVER_B);
     packet_ready = false; packet_index = 0;
   }
 
@@ -466,18 +529,23 @@ void loop() {
     memcpy(&next_event, (const void*)&event_queue[queue_tail], sizeof(Event));
     queue_tail = (queue_tail + 1) % MAX_QUEUE_SIZE;
 
+    Serial.println("--- Gate Event Fired (Main Loop - From Queue) ---");
     char event_log[64];
-    snprintf(event_log, sizeof(event_log), "GATE EVENT: %s", next_event.status);
+    snprintf(event_log, sizeof(event_log), "GATE EVENT: %s detected by %s.", next_event.status, next_event.source);
     logToLittleFS(event_log); 
 
     if (WiFi.status() == WL_CONNECTED) getTimestamp(); 
     else strncpy(current_data.timestamp, "LOCAL", TIMESTAMP_SIZE);
 
     strncpy(current_data.status, next_event.status, STATUS_SIZE);
-    
+    Serial.printf("Trigger Source: %s - Detected State: %s\n", next_event.source, current_data.status);
+
     if (WiFi.status() == WL_CONNECTED && time(nullptr) > 100000) {
+        Serial.println("WiFi connected. Time synchronized. Attempting SECURE notifications...");
         sendPushover(); 
         if (is_online_mode) publishMQTTEvent();
+    } else {
+        Serial.println("WARNING: Sync failed or offline. Skipping notifications.");
     }
   }
   delay(10);
